@@ -1,26 +1,130 @@
 'use client';
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useCart } from '../context/CartContext';
+import { createClient } from '../lib/supabase/client';
+
+type Step = 'form' | 'otp' | 'done';
 
 export default function ContactoPage() {
   const { t } = useCart();
-  const [sent, setSent] = useState(false);
-  const [form, setForm] = useState({ nome: '', email: '', mensagem: '' });
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const supabase = createClient();
 
-  const validate = () => {
+  const [step, setStep] = useState<Step>('form');
+  const [form, setForm] = useState({ nome: '', email: '', mensagem: '' });
+  const [otp, setOtp] = useState('');
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [serverError, setServerError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  // Track when the visitor landed on the page to compute session time.
+  const startedAt = useRef<number>(Date.now());
+
+  // Collect lightweight visitor metadata available client-side.
+  const collectVisitorMeta = () => {
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+    let browser = 'Desconhecido';
+    if (/Edg\//.test(ua)) browser = 'Edge';
+    else if (/OPR\/|Opera/.test(ua)) browser = 'Opera';
+    else if (/SamsungBrowser/.test(ua)) browser = 'Samsung Internet';
+    else if (/Firefox\//.test(ua)) browser = 'Firefox';
+    else if (/Chrome\//.test(ua)) browser = 'Chrome';
+    else if (/Safari\//.test(ua)) browser = 'Safari';
+
+    const location =
+      typeof Intl !== 'undefined'
+        ? Intl.DateTimeFormat().resolvedOptions().timeZone || 'Desconhecido'
+        : 'Desconhecido';
+
+    const sessionSeconds = Math.max(1, Math.round((Date.now() - startedAt.current) / 1000));
+
+    return {
+      browser: `${browser} (${ua.slice(0, 80)})`,
+      location,
+      phone_spec: ua,
+      session_time_seconds: sessionSeconds,
+    };
+  };
+
+  const validateForm = () => {
     const errs: Record<string, string> = {};
     if (!form.nome.trim()) errs.nome = 'Nome é obrigatório';
+    if (!form.email.trim()) errs.email = 'Email é obrigatório';
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) errs.email = 'Email inválido';
     if (!form.mensagem.trim()) errs.mensagem = 'Mensagem é obrigatória';
     return errs;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Step 1: send the OTP code to the provided email.
+  const handleSendOtp = async (e: React.FormEvent) => {
     e.preventDefault();
-    const errs = validate();
-    if (Object.keys(errs).length > 0) { setErrors(errs); return; }
-    // Simulate send
-    setSent(true);
+    setServerError('');
+    const errs = validateForm();
+    if (Object.keys(errs).length > 0) {
+      setErrors(errs);
+      return;
+    }
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithOtp({
+      email: form.email,
+      options: { shouldCreateUser: true },
+    });
+    setLoading(false);
+    if (error) {
+      setServerError(error.message);
+      return;
+    }
+    setStep('otp');
+  };
+
+  // Step 2: verify the OTP and, on success, store the visitor record.
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setServerError('');
+    if (otp.trim().length < 6) {
+      setServerError('Introduza o código de 6 dígitos.');
+      return;
+    }
+    setLoading(true);
+
+    const { error: verifyError } = await supabase.auth.verifyOtp({
+      email: form.email,
+      token: otp.trim(),
+      type: 'email',
+    });
+
+    if (verifyError) {
+      setLoading(false);
+      setServerError('Código inválido ou expirado. Tente novamente.');
+      return;
+    }
+
+    const meta = collectVisitorMeta();
+    const { error: insertError } = await supabase.from('visitors').insert({
+      visitor_name: form.nome,
+      email: form.email,
+      location: meta.location,
+      browser: meta.browser,
+      session_time_seconds: meta.session_time_seconds,
+      phone_spec: meta.phone_spec,
+    });
+
+    setLoading(false);
+    if (insertError) {
+      setServerError('Não foi possível guardar os seus dados. Tente novamente.');
+      return;
+    }
+    setStep('done');
+  };
+
+  const handleResend = async () => {
+    setServerError('');
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithOtp({
+      email: form.email,
+      options: { shouldCreateUser: true },
+    });
+    setLoading(false);
+    if (error) setServerError(error.message);
   };
 
   return (
@@ -99,17 +203,67 @@ export default function ContactoPage() {
 
         {/* Contact form */}
         <section aria-label="Formulário de contacto">
-          {sent ? (
+          {step === 'done' ? (
             <div className="bg-[#004d40] text-white p-10 rounded-sm text-center" role="status" aria-live="polite">
               <svg aria-hidden="true" className="w-12 h-12 text-[#ff9800] mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
-              <h3 className="font-black uppercase text-lg mb-2">Mensagem Enviada!</h3>
-              <p className="text-[11px] font-medium opacity-70">Responderemos em breve via WhatsApp ou email.</p>
+              <h3 className="font-black uppercase text-lg mb-2">Email Verificado!</h3>
+              <p className="text-[11px] font-medium opacity-70">A sua mensagem foi recebida. Responderemos em breve via WhatsApp ou email.</p>
             </div>
+          ) : step === 'otp' ? (
+            <form
+              onSubmit={handleVerifyOtp}
+              noValidate
+              className="space-y-5 bg-white p-8 border border-gray-100 shadow-sm rounded-sm"
+              aria-label="Verificar código"
+            >
+              <h2 className="font-black uppercase text-[11px] tracking-widest text-[#004d40] mb-1">Verificar Email</h2>
+              <p className="text-[11px] font-medium text-gray-500 leading-relaxed">
+                Enviámos um código de 6 dígitos para <span className="font-bold text-gray-700">{form.email}</span>. Introduza-o abaixo para confirmar.
+              </p>
+
+              <div>
+                <label htmlFor="otp" className="block text-[10px] font-black uppercase tracking-widest text-gray-500 mb-1.5">
+                  Código de verificação <span className="text-red-500" aria-label="obrigatório">*</span>
+                </label>
+                <input
+                  id="otp"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  placeholder="000000"
+                  value={otp}
+                  onChange={(e) => { setOtp(e.target.value.replace(/\D/g, '')); setServerError(''); }}
+                  aria-required="true"
+                  className="w-full border-b-2 py-3 text-lg font-bold tracking-[0.5em] text-center focus:outline-none transition-colors border-gray-200 focus:border-[#ff9800]"
+                />
+              </div>
+
+              {serverError && (
+                <p role="alert" className="text-red-500 text-[10px] font-bold">{serverError}</p>
+              )}
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full bg-[#004d40] text-white py-4 font-black uppercase text-[10px] tracking-widest hover:bg-[#ff9800] focus:outline-none focus:ring-2 focus:ring-[#ff9800] focus:ring-offset-2 transition-colors rounded-sm disabled:opacity-50"
+              >
+                {loading ? 'A verificar…' : 'Confirmar e Enviar'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={loading}
+                className="w-full text-[10px] font-black text-[#004d40] uppercase tracking-widest hover:text-[#ff9800] focus:outline-none focus:underline transition-colors disabled:opacity-50"
+              >
+                Reenviar código
+              </button>
+            </form>
           ) : (
             <form
-              onSubmit={handleSubmit}
+              onSubmit={handleSendOtp}
               noValidate
               className="space-y-5 bg-white p-8 border border-gray-100 shadow-sm rounded-sm"
               aria-label="Enviar mensagem"
@@ -118,7 +272,7 @@ export default function ContactoPage() {
 
               {[
                 { id: 'nome', label: t('name'), type: 'text', required: true, autoComplete: 'name', placeholder: 'José Maluleque' },
-                { id: 'email', label: 'Email (opcional)', type: 'email', required: false, autoComplete: 'email', placeholder: 'jose@exemplo.co.mz' },
+                { id: 'email', label: 'Email', type: 'email', required: true, autoComplete: 'email', placeholder: 'jose@exemplo.co.mz' },
               ].map((field) => (
                 <div key={field.id}>
                   <label htmlFor={field.id} className="block text-[10px] font-black uppercase tracking-widest text-gray-500 mb-1.5">
@@ -165,11 +319,16 @@ export default function ContactoPage() {
                 )}
               </div>
 
+              {serverError && (
+                <p role="alert" className="text-red-500 text-[10px] font-bold">{serverError}</p>
+              )}
+
               <button
                 type="submit"
-                className="w-full bg-[#004d40] text-white py-4 font-black uppercase text-[10px] tracking-widest hover:bg-[#ff9800] focus:outline-none focus:ring-2 focus:ring-[#ff9800] focus:ring-offset-2 transition-colors rounded-sm"
+                disabled={loading}
+                className="w-full bg-[#004d40] text-white py-4 font-black uppercase text-[10px] tracking-widest hover:bg-[#ff9800] focus:outline-none focus:ring-2 focus:ring-[#ff9800] focus:ring-offset-2 transition-colors rounded-sm disabled:opacity-50"
               >
-                {t('send')}
+                {loading ? 'A enviar código…' : 'Verificar Email e Enviar'}
               </button>
             </form>
           )}
