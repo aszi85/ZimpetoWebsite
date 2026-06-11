@@ -1,13 +1,11 @@
 'use client';
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { useCart } from '../context/CartContext';
-import { createClient } from '../lib/supabase/client';
 
 type Step = 'form' | 'otp' | 'done';
 
 export default function ContactoPage() {
   const { t } = useCart();
-  const supabase = createClient();
 
   const [step, setStep] = useState<Step>('form');
   const [form, setForm] = useState({ nome: '', email: '', mensagem: '' });
@@ -64,16 +62,23 @@ export default function ContactoPage() {
       return;
     }
     setLoading(true);
-    const { error } = await supabase.auth.signInWithOtp({
-      email: form.email,
-      options: { shouldCreateUser: true },
-    });
-    setLoading(false);
-    if (error) {
-      setServerError(error.message);
-      return;
+    try {
+      const res = await fetch('/api/otp/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: form.email }),
+      });
+      const data = await res.json();
+      setLoading(false);
+      if (!res.ok) {
+        setServerError(data.error ?? 'Não foi possível enviar o código.');
+        return;
+      }
+      setStep('otp');
+    } catch {
+      setLoading(false);
+      setServerError('Erro de ligação. Tente novamente.');
     }
-    setStep('otp');
   };
 
   // Step 2: verify the OTP and, on success, store the visitor record.
